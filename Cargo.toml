@@ -1,0 +1,22 @@
+[package]
+name = "kamino-sentinel"
+version = "0.1.0"
+edition = "2024"
+description = "ZeroClaw tool plugin: watches Kamino lending positions and reports LTV / liquidation cushion"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+wit-bindgen = "0.46"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+waki = "0.5.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

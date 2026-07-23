@@ -1,0 +1,7 @@
+name = "kamino-sentinel"
+version = "0.1.0"
+description = "Watches Kamino lending positions: LTV, liquidation cushion, OK/WARN/DANGER verdict"
+author = "shud26"
+wasm_path = "kamino-sentinel.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
