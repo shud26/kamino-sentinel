@@ -9,7 +9,7 @@ A ZeroClaw tool plugin that watches your [Kamino](https://kamino.finance) (Solan
 
 It reports LTV, liquidation threshold, and the **cushion** (percentage points between your current LTV and the liquidation LTV) for every obligation in the wallet, with an overall `OK / WARN / DANGER / NO-POSITION` verdict. Paired with ZeroClaw's cron scheduler and Telegram channel, it runs unattended and pings you every morning.
 
-Built for the Superteam bounty *"Build Solana-native plugins for ZeroClaw"* — and run daily against a real wallet while it was being built (see [Field log](#field-log)).
+Built for the Superteam bounty *"Build Solana-native plugins for ZeroClaw"*, and run on a daily unattended cron while it was being built (see [Field log](#field-log)).
 
 ## Why a sentinel, not a dashboard
 
@@ -89,7 +89,36 @@ Run the daemon (`zeroclaw daemon` — e.g. under launchd/systemd) and the report
 
 ## Field log
 
-This plugin is dogfooded: a launchd-managed ZeroClaw daemon on a Mac has been firing the 08:00 KST cron daily against a real wallet since 2026-07-22, with the report delivered over Telegram. The build-out itself (first Rust install → hello component → live-data spike → this sentinel, in one day) is written up on my blog: [shud26.com](https://shud26.com).
+This plugin is dogfooded. A launchd-managed ZeroClaw daemon on a Mac has been firing the 08:00 KST cron since 2026-07-22, with the report delivered over Telegram.
+
+Being precise about what that log shows, because it changed partway through:
+
+- **2026-07-22 to 07-26** — the cron ran daily and reported `NO-POSITION`. This exercised the scheduler, the config-fallback wallet path, the API round-trip and the Telegram delivery, but not the LTV/cushion math against live numbers.
+- **from 2026-07-26** — pointed at a wallet holding an actual Kamino obligation, so the daily report carries real deposit/borrow/LTV/cushion values.
+
+Live output against that obligation:
+
+```
+[OK] Kamino sentinel — 4DNPMDrqt6UgyApJ12RqqV9KqBboLNgDEsWVmnHvmkqh
+- #1: deposit $97.46 | borrow $25.00 | LTV 25.7% -> liq 75.0% (cushion 49.3%p)
+```
+
+The position is deliberately conservative, so it classifies as `OK` and will keep doing so unless SOL drops by roughly two thirds. To confirm the classifier actually fires on live data rather than only in tests, the thresholds were temporarily raised so that the same real position crossed each boundary:
+
+```
+warn_cushion=55 danger_cushion=50
+[DANGER] Kamino sentinel — 4DNPMDrqt6…
+!! #1: deposit $97.46 | borrow $25.00 | LTV 25.6% -> liq 75.0% (cushion 49.4%p)
+cushion <= 50.0%p: consider repaying or adding collateral NOW.
+
+warn_cushion=55 danger_cushion=40
+Kamino sentinel — 4DNPMDrqt6…
+! #1: deposit $97.46 | borrow $25.00 | LTV 25.7% -> liq 75.0% (cushion 49.3%p)
+```
+
+Thresholds were restored to `warn_cushion=10 / danger_cushion=5` afterwards. The boundary arithmetic itself is pinned by unit tests in `src/sentinel.rs`.
+
+The build-out (first Rust install → hello component → live-data spike → this sentinel, in one day) is written up on my blog: [shud26.com](https://shud26.com).
 
 ## License
 
