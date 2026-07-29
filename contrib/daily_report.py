@@ -17,6 +17,29 @@ This script splits the two steps and uses the CLI paths that do have channel acc
     zeroclaw agent -m ...      -> produce the report
     zeroclaw channel send ...  -> deliver it
 
+The verdict comes from the tool, not from the model
+---------------------------------------------------
+The model is only a trigger for the tool call. Its prose is not the report and is never
+delivered. Asking a model to "reply with the exact tool output" works on a large model
+and fails on a small one: a 14B model called the tool correctly and then paraphrased the
+result into a friendly summary with the `[OK]` verdict dropped, and a 7B model looped on
+the call until the host's circuit breaker stopped it.
+
+So the report is read back from the tool result recorded in ZeroClaw's runtime trace,
+filtered to entries newer than the moment this run started. Whatever the model says
+afterwards is ignored. That keeps the delivered text byte-identical to what the plugin
+produced and makes the script work with whatever model the host can afford to run.
+
+Once that result appears the agent is killed rather than waited on, because everything
+after the tool call is the model talking to itself. This is also what makes the job fit
+the scheduler's budget: ZeroClaw kills a shell cron job at 120 s (hardcoded in
+`SHELL_JOB_TIMEOUT_SECS`), and on a small always-on box a local model can spend six
+minutes narrating after a tool call that returned in seventy seconds. Waiting for the
+model to finish is what blows the budget; the report itself is ready long before.
+
+A pleasant side effect: a model that loops on the tool call no longer matters either,
+since the first result ends the run.
+
 Failure policy (the point of a sentinel)
 ----------------------------------------
 Never stay silent, and never let a failure look like a clean verdict. If the report
@@ -35,11 +58,16 @@ Usage
     --agent      agent alias to run as         (default: spike,    or $ZC_AGENT)
     --channel    channel id for `channel send` (default: telegram, or $ZC_CHANNEL)
     --recipient  chat id / recipient           (required,          or $ZC_RECIPIENT)
+    --trace      runtime trace path            (default: ~/.zeroclaw/data/state/runtime-trace.jsonl)
+    --deadline   seconds to wait for the tool result (default: 95, or $ZC_DEADLINE)
 """
 import argparse
+import datetime
+import json
 import os
 import subprocess
 import sys
+import time
 
 PROMPT = ("Call the kamino_sentinel tool with no arguments. "
           "Reply with the exact tool output text only, no commentary.")
@@ -51,8 +79,11 @@ UNKNOWN_PREFIX = ("[UNKNOWN] Kamino sentinel could not read the position. "
 # sentence from the model would go out looking like a position report.
 VERDICTS = ("[OK]", "[WARN]", "[DANGER]", "NO-POSITION")
 
-AGENT_TIMEOUT_S = 300
 SEND_TIMEOUT_S = 60
+TOOL_NAME = "kamino_sentinel"
+DEFAULT_TRACE = "~/.zeroclaw/data/state/runtime-trace.jsonl"
+# ZeroClaw kills a shell cron job at 120 s, so leave room for delivery afterwards.
+DEFAULT_DEADLINE_S = 95
 
 
 def parse_args():
@@ -61,10 +92,50 @@ def parse_args():
     p.add_argument("--agent", default=os.environ.get("ZC_AGENT", "spike"))
     p.add_argument("--channel", default=os.environ.get("ZC_CHANNEL", "telegram"))
     p.add_argument("--recipient", default=os.environ.get("ZC_RECIPIENT"))
+    p.add_argument("--trace", default=os.environ.get("ZC_TRACE", DEFAULT_TRACE))
+    p.add_argument("--deadline", type=float,
+                   default=float(os.environ.get("ZC_DEADLINE", DEFAULT_DEADLINE_S)),
+                   help="seconds to wait for the tool result before giving up")
     a = p.parse_args()
     if not a.recipient:
         p.error("--recipient (or ZC_RECIPIENT) is required")
+    a.trace = os.path.expanduser(a.trace)
     return a
+
+
+def tool_output_since(trace_path, since_iso):
+    """Newest kamino_sentinel tool result recorded after `since_iso`, or None.
+
+    Read from the trace rather than the model's reply so the delivered text is exactly
+    what the plugin produced. Entries older than this run are ignored so a stale result
+    can never be re-delivered as if it were today's.
+    """
+    best = None
+    try:
+        with open(trace_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or TOOL_NAME not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get("message") != "tool_call_result":
+                    continue
+                attrs = row.get("attributes") or {}
+                if attrs.get("tool") != TOOL_NAME:
+                    continue
+                ts = row.get("@timestamp", "")
+                if ts <= since_iso:
+                    continue
+                out = attrs.get("output")
+                if isinstance(out, str) and out.strip():
+                    if best is None or ts >= best[0]:
+                        best = (ts, out.strip())
+    except OSError:
+        return None
+    return best[1] if best else None
 
 
 def deliver(args, body):
@@ -84,19 +155,52 @@ def deliver(args, body):
 
 
 def produce(args):
-    """Run the sentinel once. Returns (report_text, ok)."""
+    """Run the sentinel once. Returns (report_text, ok).
+
+    Starts the agent, watches the trace, and stops as soon as the tool result lands.
+    The model's own reply is only a fallback for hosts that do not write a trace, and
+    it must still carry a verdict to be accepted.
+    """
+    started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    proc = subprocess.Popen(
+        [args.bin, "agent", "--agent", args.agent, "-m", PROMPT],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
+
+    deadline = time.monotonic() + args.deadline
+    found = None
+    while time.monotonic() < deadline:
+        found = tool_output_since(args.trace, started)
+        if found and any(v in found for v in VERDICTS):
+            break
+        found = None
+        if proc.poll() is not None:      # agent exited on its own
+            break
+        time.sleep(1.0)
+
+    if proc.poll() is None:
+        # Everything after the tool call is the model narrating. Stop paying for it.
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if found:
+        return found, True
+
+    # No tool result. Fall back to whatever the agent printed, if it carries a verdict.
     try:
-        r = subprocess.run(
-            [args.bin, "agent", "--agent", args.agent, "-m", PROMPT],
-            capture_output=True, text=True, timeout=AGENT_TIMEOUT_S)
+        out, err = proc.communicate(timeout=10)
     except subprocess.TimeoutExpired:
-        return "agent run timed out after %ds" % AGENT_TIMEOUT_S, False
-    text = (r.stdout or "").strip()
-    if r.returncode != 0:
-        return (r.stderr or text).strip(), False
-    if not any(v in text for v in VERDICTS):
-        return text, False
-    return text, True
+        proc.kill()
+        out, err = "", ""
+    text = (out or "").strip()
+    if any(v in text for v in VERDICTS):
+        return text, True
+    detail = text or (err or "").strip()
+    return ("no verdict recovered from trace or agent output within %ds\n%s"
+            % (args.deadline, detail[:300])), False
 
 
 def main():

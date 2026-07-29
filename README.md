@@ -109,8 +109,19 @@ for a scheduled one).
 ### What does work
 
 Split the two steps and use the CLI paths that do have channel access. `contrib/daily_report.py`
-does exactly that: it runs the sentinel once via `zeroclaw agent -m`, checks that the output
-carries a real verdict, and delivers it with `zeroclaw channel send`.
+does exactly that: it runs the sentinel once via `zeroclaw agent -m`, takes the report from the
+**tool result recorded in the runtime trace** rather than from the model's reply, and delivers it
+with `zeroclaw channel send`.
+
+Reading the trace instead of the model's answer is not fussiness. Asking a model to "reply with the
+exact tool output" holds on a large model and breaks on a small one: a 14B model called the tool
+correctly and then paraphrased the result into a friendly summary with the `[OK]` verdict dropped,
+and a 7B model looped on the call until the host's circuit breaker stopped the run. Taking the tool
+result directly makes the delivered text byte-identical to what the plugin produced, and makes the
+whole thing work on whatever model the host can afford.
+
+The script also stops the agent the moment that result appears, because everything after the tool
+call is the model narrating. That is what keeps the job inside the scheduler's budget — see below.
 
 ```sh
 zeroclaw cron add '0 8 * * *' \
@@ -120,6 +131,14 @@ zeroclaw cron add '0 8 * * *' \
 
 It is Python rather than shell because ZeroClaw's default risk profile allowlists `python3` for
 scheduled commands but not `sh`, so this needs no loosening of the host security policy.
+
+**Mind the 120 second budget.** ZeroClaw kills a shell cron job at 120 s
+(`SHELL_JOB_TIMEOUT_SECS` in `crates/zeroclaw-runtime/src/cron/scheduler.rs`, not configurable).
+On a small always-on box that is easy to blow: a 14B local model returned the tool result in 74 s
+and then spent another five minutes talking, so the run was killed at 120 s with nothing delivered
+even though the report had been ready the whole time. Stopping at the tool result cuts the same job
+to **35 s** on a 7B model, with delivery included. Tune `--deadline` (default 95 s) if your host is
+slower.
 
 Its failure policy matters more than the happy path. If the run fails, times out, or returns text
 without a recognised verdict, it delivers an explicit `[UNKNOWN] ... This is NOT a NO-POSITION result`
@@ -161,7 +180,7 @@ this section claimed more than the evidence supported:
 Two more limits worth stating rather than hiding:
 
 - **A green cron status is not delivery.** The run that failed to send is recorded `ok` with the report as its output. Anything built on top of this should check the delivery result, not the job status. Ironically this is the same failure mode the plugin itself is written to avoid: a fetch failure must not be reported as a clean verdict, which is why a failed fetch returns a tool error rather than `NO-POSITION`.
-- **The host is a laptop, so "every morning at 08:00" is aspirational.** The 2026-07-28 run started on time at 08:08 KST and took 2 h 17 min to finish because the machine slept mid-run. An always-on host is the right home for this.
+- **A laptop is the wrong host, and it has been moved off one.** The 2026-07-28 run started on time at 08:08 KST and took 2 h 17 min to finish because the machine slept mid-run. On 2026-07-29 the whole setup moved to an always-on Mac mini (M2, 16 GB): the release binary is portable between Apple Silicon Macs as long as the OS matches, so no rebuild was needed, only the binary, the plugin `dist/`, and the config. The smaller box cannot host a 30B model, which is what surfaced both the paraphrasing problem and the 120 s budget above; it now runs `qwen2.5:7b` and the daily job finishes in 35 s. Verified through the scheduler on the new host, again by `message_id`.
 
 Live output against that obligation:
 
