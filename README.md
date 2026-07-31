@@ -163,6 +163,25 @@ the message arrived:
 zeroclaw cron once 1m '<same command>' --agent <agent>
 ```
 
+Then confirm the chat's `message_id` advanced. The one-shot is deliberate — a recurring job would
+make you wait until tomorrow — but note that ZeroClaw **deletes a one-shot job and its run history
+once it fires**, so the scheduler keeps no record of it afterwards and `message_id` is the only
+evidence left.
+
+For the recurring job, the per-run history does persist, though not anywhere the CLI will show you:
+`zeroclaw cron list` prints only the most recent result. The rest is in SQLite.
+
+```sh
+sqlite3 -header -column ~/.zeroclaw/data/cron/jobs.db \
+  "SELECT started_at, status, duration_ms FROM cron_runs ORDER BY started_at DESC LIMIT 10;"
+```
+
+With this script as the command, that history is worth something. `status` is `ok` only when the
+command exited 0 (the `output` column carries the raw `status=exit status: 0`), and the script only
+exits 0 after `zeroclaw channel send` succeeded. A row reading `ok` is a delivery receipt, not just
+proof that something ran — which is precisely what the same column did **not** mean back when the
+job was an agent prompt calling `send_via`.
+
 ## Field log
 
 This plugin is dogfooded. A launchd-managed ZeroClaw daemon on a Mac has been firing the 08:00 KST cron since 2026-07-22.
@@ -174,13 +193,22 @@ this section claimed more than the evidence supported:
 - **from 2026-07-26** — pointed at a wallet holding an actual Kamino obligation, so the daily report carries real deposit/borrow/LTV/cushion values.
 - **2026-07-28 — the Telegram delivery step was found to have never worked from the cron.** Every scheduled run generated the correct report and recorded `ok`, and `send_via` failed underneath with `Channel 'telegram.default' not found. Available: []`. The channel itself was fine: `zeroclaw channel doctor` reported `healthy`, and a direct Telegram API call to the same bot and chat succeeded. The `message_id` returned by that direct call was 3, so at most two messages had ever reached the chat — inconsistent with the daily delivery an earlier version of this section claimed.
 - **2026-07-28 — fixed, and the fix is not the obvious one.** Binding the channel to the agent in config was tried first and re-verified with a one-shot scheduled run; the scheduled turn still saw `Available: []`. Delivery now runs through `contrib/daily_report.py`, which produces the report with `zeroclaw agent -m` and delivers it with `zeroclaw channel send`. Verified end to end through the scheduler, not just by hand: a one-shot cron run at 14:22 UTC produced the report and the next `message_id` in the chat was 10, with 9 being the message that run delivered.
+- **2026-07-30 and 07-31 — two consecutive unattended days on the new host, both delivered.** These are the first scheduled runs where a green status is evidence rather than decoration: `daily_report.py` exits non-zero when delivery fails, so the scheduler recording `exit status: 0` *is* the delivery receipt. `zeroclaw cron list` only keeps the most recent result; the per-run history lives in the `cron_runs` table of `~/.zeroclaw/data/cron/jobs.db`:
 
-**So what this field log establishes:** the scheduler fires, the plugin runs unattended against a live wallet, the report is correct, and since 2026-07-28 it actually arrives. For the six days before that, the unattended *notification* half was broken and looked healthy.
+  ```
+  started_at (UTC)                  status  duration_ms
+  2026-07-29T23:00:02+00:00         ok      32827
+  2026-07-30T23:00:01+00:00         ok      36695
+  ```
+
+  Both are 08:00 KST starts on the always-on box, and the 33–37 s durations are where the timing quoted below comes from.
+
+**So what this field log establishes:** the scheduler fires, the plugin runs unattended against a live wallet, the report is correct, and since 2026-07-28 it actually arrives — on hardware that does not sleep, for every scheduled run since the move. For the six days before that, the unattended *notification* half was broken and looked healthy.
 
 Two more limits worth stating rather than hiding:
 
 - **A green cron status is not delivery.** The run that failed to send is recorded `ok` with the report as its output. Anything built on top of this should check the delivery result, not the job status. Ironically this is the same failure mode the plugin itself is written to avoid: a fetch failure must not be reported as a clean verdict, which is why a failed fetch returns a tool error rather than `NO-POSITION`.
-- **A laptop is the wrong host, and it has been moved off one.** The 2026-07-28 run started on time at 08:08 KST and took 2 h 17 min to finish because the machine slept mid-run. On 2026-07-29 the whole setup moved to an always-on Mac mini (M2, 16 GB): the release binary is portable between Apple Silicon Macs as long as the OS matches, so no rebuild was needed, only the binary, the plugin `dist/`, and the config. The smaller box cannot host a 30B model, which is what surfaced both the paraphrasing problem and the 120 s budget above; it now runs `qwen2.5:7b` and the daily job finishes in 35 s. Verified through the scheduler on the new host, again by `message_id`.
+- **A laptop is the wrong host, and it has been moved off one.** The 2026-07-28 run started on time at 08:08 KST and took 2 h 17 min to finish because the machine slept mid-run. On 2026-07-29 the whole setup moved to an always-on Mac mini (M2, 16 GB): the release binary is portable between Apple Silicon Macs as long as the OS matches, so no rebuild was needed, only the binary, the plugin `dist/`, and the config. The smaller box cannot host a 30B model, which is what surfaced both the paraphrasing problem and the 120 s budget above; it now runs `qwen2.5:7b` and the daily job finishes in about 35 s. Verified through the scheduler on the new host, again by `message_id`.
 
 Live output against that obligation:
 
