@@ -202,8 +202,8 @@ mod tests {
     }
 }
 
-/// 어떤 HTTP 실패를 다시 물어볼 값어치가 있는가.
-/// lib.rs 의 재시도 판정과 같은 규칙 (WASM 바인딩 없이 검증하려고 여기 둔다).
+/// Which HTTP failures are worth asking about again.
+/// Same rule `lib.rs` retries on, kept here so it can be tested without the WASM bindings.
 pub fn is_retryable(status: u16) -> bool {
     status >= 500 || status == 429
 }
@@ -214,17 +214,17 @@ mod retry_tests {
 
     #[test]
     fn server_errors_and_rate_limit_are_retryable() {
-        // 실제로 겪은 것: Kamino 가 520(Cloudflare origin error)을 간헐적으로 뱉는다.
+        // Observed in practice: Kamino intermittently returns 520 (Cloudflare origin error).
         for s in [500, 502, 503, 504, 520, 429] {
-            assert!(is_retryable(s), "{s} 는 재시도 대상이어야 한다");
+            assert!(is_retryable(s), "{s} should be retried");
         }
     }
 
     #[test]
     fn client_errors_are_not_retryable() {
-        // 잘못된 지갑 주소 같은 건 몇 번을 물어도 같은 답이 온다.
+        // A malformed wallet address returns the same answer however often you ask.
         for s in [400, 401, 403, 404, 422] {
-            assert!(!is_retryable(s), "{s} 는 재시도하면 안 된다");
+            assert!(!is_retryable(s), "{s} should not be retried");
         }
     }
 
