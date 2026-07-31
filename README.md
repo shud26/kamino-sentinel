@@ -24,7 +24,7 @@ Lending positions fail quietly: collateral drifts down, a borrow accrues interes
 
 ```
 src/sentinel.rs   pure logic: config parsing, classification, report rendering
-                  — no wasm, no HTTP, natively testable (7 unit tests)
+                  — no wasm, no HTTP, natively testable (10 unit tests)
 src/lib.rs        thin glue: WIT bindings, Kamino REST fetch (waki), arg handling
 ```
 
@@ -33,6 +33,70 @@ Decisions worth stating:
 - **Stateless by contract.** ZeroClaw tool plugins get a fresh store per call, so the plugin holds no state at all; every invocation fetches live data from Kamino's public API (`/kamino-market/{market}/users/{wallet}/obligations`).
 - **Config-fallback wallet.** The `wallet` argument is optional; when omitted, the operator-configured wallet is used. This is what makes an *unattended* cron run possible — the model doesn't need to know your address, and your address never appears in a prompt.
 - **Fail soft, fail loud.** Malformed config values fall back to safe defaults (`warn >= danger` is enforced); HTTP/parse failures return a proper tool error instead of a fake verdict.
+
+## Why this is a plugin and not a skill
+
+A fair objection: this fetches one HTTP endpoint. The built-in `http_request` tool plus a
+well-written skill can fetch an endpoint, and a tier-1 answer to a tier-1 problem is the better
+engineering. So what earns the compile step here is not the fetch — it is the decision layer
+around it.
+
+- **The verdict must not be model-generated.** This is the load-bearing reason, and it is not
+  theoretical: see the [field log](#field-log). Asked to relay the exact tool output, a 14B model
+  called the tool correctly and then paraphrased the result into a friendly summary with the `[OK]`
+  verdict removed; a 7B model looped on the call. If `OK / WARN / DANGER` were produced by a skill's
+  instructions, the alert would be a model output — its reliability a function of which model the
+  operator could afford to run that month. Here it is `classify()`, pinned by unit tests and
+  byte-identical on every run. A watchdog whose verdict is a matter of model temperament is not a
+  watchdog.
+- **Output shaping.** The obligations response for a *single* position is 17.5 KB of JSON — full
+  per-reserve deposit and borrow arrays, thirteen `refreshedStats` fields, addresses and tags —
+  roughly 4,400 tokens. The plugin returns three lines, about 40. A skill wrapping `http_request`
+  would push the whole document through the context window on every scheduled call, every day, and
+  bill the operator for it. (Measured against the live endpoint, 2026-07-31.)
+- **The arithmetic has edge cases worth testing.** Cushion computation, `warn >= danger`
+  enforcement against malformed config, and the deposit-only case (no borrow, so no liquidation
+  price, so `OK` regardless of thresholds) are the kind of thing that belongs in tests rather than
+  in prose an LLM interprets.
+
+The HTTP call really is tier-1 shaped. The classifier is what is compiled, and it is compiled
+because an alerting tool should be deterministic.
+
+## Custody and threat model
+
+**Custody tier: T0 (Read).** The plugin reads. It holds no keys of any kind — not a signing key,
+and not even an RPC key, because Kamino's public REST API takes no authentication. There is no
+code path that constructs, signs, or submits a transaction; `wasi:http` outbound requests and a
+config read are the entire capability surface (`permissions = ["http_client", "config_read"]`).
+The only operator data it touches is a wallet **address**, which is public on-chain information,
+and two numeric thresholds.
+
+Because it cannot move funds, the prompt-injection-into-payment scenario does not apply. The
+attack surface that does exist is worth naming rather than skipping:
+
+- **Injection can change what gets *reported*, not what gets *moved*.** The `wallet` argument is
+  model-supplied, so a hostile message in a shared channel could get the agent to call the tool
+  with an attacker-chosen address and hand back a stranger's position. The result is a confusing
+  report, not a loss. The scheduled path avoids it structurally: the cron prompt passes no
+  argument, so the config wallet is used and the address never enters the prompt at all.
+- **Injection cannot rewrite or suppress the report.** This is where taking the report from the
+  runtime trace instead of the model's reply stops being a reliability fix and becomes a security
+  property: `daily_report.py` delivers the tool's own output, so no amount of persuasion in the
+  model's context can soften a `DANGER` line, and a run that produces no verdict sends an explicit
+  `[UNKNOWN]` alert rather than silence. The delivered text is not something the model gets a vote on.
+- **One third party is trusted: Kamino's API.** Deposit, borrow, LTV and liquidation-LTV figures
+  are taken as given. Wrong numbers upstream mean a wrong verdict downstream, and no amount of
+  local testing changes that. The mitigation is limited to failing loudly when the API is
+  unreachable or unparseable rather than degrading to `NO-POSITION` — a fetch failure must never be
+  indistinguishable from "you have no position."
+- **The report is as private as its channel.** It reveals position size to anyone who can read the
+  destination chat. The Telegram bot token lives in ZeroClaw's config, encrypted at rest.
+
+What it does not defend against, stated plainly: it is a once-a-day cron sentinel, so its worst
+case is a position that crosses from healthy to liquidated between two runs. It reports; it cannot
+intervene, and it is not a substitute for a liquidation bot or for position sizing that survives a
+bad night. Raising the frequency is a config change, but the honest limit at 08:00 daily is that
+it catches drift, not a crash.
 
 ## Build
 
@@ -202,6 +266,29 @@ this section claimed more than the evidence supported:
   ```
 
   Both are 08:00 KST starts on the always-on box, and the 33–37 s durations are where the timing quoted below comes from.
+- **2026-07-31 — the same failure mode again, this time inside the delivery script.** Auditing the
+  success path turned up a fetch failure that would have been delivered as a clean verdict.
+  `daily_report.py` decided whether a run had produced a report by testing for the verdict tokens
+  as substrings anywhere in the text; the plugin's fetch-failure message contains the token
+  `NO-POSITION` inside the sentence that denies it ("this is NOT a NO-POSITION result"). So an
+  outage at Kamino's API would have matched, been treated as today's report, and exited 0 —
+  the operator still saw an `[UNKNOWN]` message, but the scheduler would have recorded a green
+  run for a failed one. Reproduced against the live host by calling the tool with an invalid
+  wallet and reading the resulting trace entry, not by reasoning about it:
+
+  ```
+  attributes.error_reason = "[UNKNOWN] Kamino 조회 실패 — INVALIDWALLET123 …"
+  attributes.output       = "Error: [UNKNOWN] … 이것은 NO-POSITION(포지션 없음)이 아닙니다 …"
+  ```
+
+  Fixed two ways: verdict recognition is now anchored to a bracketed tag at the start of the first
+  line (which is how `report()` renders every verdict), and trace entries carrying `error_reason`
+  are skipped outright — a signal the script had been ignoring. Both are pinned by
+  `contrib/test_daily_report.py`, whose failure fixture is the trace string above, copied verbatim.
+
+  Worth stating plainly because it is the point of the whole exercise: this project's thesis is that
+  a green status is not evidence, and it shipped six days of code that made a green status out of a
+  failure. Writing the rule down does not exempt you from it.
 
 **So what this field log establishes:** the scheduler fires, the plugin runs unattended against a live wallet, the report is correct, and since 2026-07-28 it actually arrives — on hardware that does not sleep, for every scheduled run since the move. For the six days before that, the unattended *notification* half was broken and looked healthy.
 

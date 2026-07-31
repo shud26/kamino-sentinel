@@ -75,15 +75,35 @@ PROMPT = ("Call the kamino_sentinel tool with no arguments. "
 UNKNOWN_PREFIX = ("[UNKNOWN] Kamino sentinel could not read the position. "
                   "This is NOT a NO-POSITION result. Check manually.")
 
-# A delivered message must carry one of these. Without the check, an apology or a stray
-# sentence from the model would go out looking like a position report.
-VERDICTS = ("[OK]", "[WARN]", "[DANGER]", "NO-POSITION")
+# A report is identified by its bracketed verdict tag at the start of the first line, which is
+# exactly how `report()` renders every verdict. Without the check, an apology or a stray sentence
+# from the model would go out looking like a position report.
+#
+# Matching these as substrings anywhere in the text is NOT safe, and the unsafe version shipped:
+# the plugin's own fetch-failure message contains the token NO-POSITION inside the sentence that
+# denies it ("this is NOT a NO-POSITION result"), and the host records failed tool output with an
+# "Error: " prefix. A bare `"NO-POSITION" in text` therefore accepted a fetch failure as a clean
+# verdict and exited 0, so the scheduler logged a green run for an API outage — the precise
+# confusion this tool exists to prevent, reproduced inside the tool itself.
+VERDICT_TAGS = ("[OK]", "[WARN]", "[DANGER]", "[NO-POSITION]")
 
 SEND_TIMEOUT_S = 60
 TOOL_NAME = "kamino_sentinel"
 DEFAULT_TRACE = "~/.zeroclaw/data/state/runtime-trace.jsonl"
 # ZeroClaw kills a shell cron job at 120 s, so leave room for delivery afterwards.
 DEFAULT_DEADLINE_S = 95
+
+
+def has_verdict(text):
+    """True only if `text` opens with a rendered verdict tag.
+
+    Anchored to the first line so that prose merely mentioning a verdict — including the
+    failure message that exists to say a result is *not* NO-POSITION — cannot pass.
+    """
+    if not text or not text.strip():
+        return False
+    first = text.strip().splitlines()[0]
+    return any(first.startswith(tag) for tag in VERDICT_TAGS)
 
 
 def parse_args():
@@ -129,6 +149,10 @@ def tool_output_since(trace_path, since_iso):
                 ts = row.get("@timestamp", "")
                 if ts <= since_iso:
                     continue
+                # The host records a failed tool call with `error_reason` set. Skip those
+                # outright rather than relying on the text check downstream to catch them.
+                if attrs.get("error_reason"):
+                    continue
                 out = attrs.get("output")
                 if isinstance(out, str) and out.strip():
                     if best is None or ts >= best[0]:
@@ -171,7 +195,7 @@ def produce(args):
     found = None
     while time.monotonic() < deadline:
         found = tool_output_since(args.trace, started)
-        if found and any(v in found for v in VERDICTS):
+        if has_verdict(found):
             break
         found = None
         if proc.poll() is not None:      # agent exited on its own
@@ -196,7 +220,7 @@ def produce(args):
         proc.kill()
         out, err = "", ""
     text = (out or "").strip()
-    if any(v in text for v in VERDICTS):
+    if has_verdict(text):
         return text, True
     detail = text or (err or "").strip()
     return ("no verdict recovered from trace or agent output within %ds\n%s"
