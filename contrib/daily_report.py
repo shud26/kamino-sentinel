@@ -47,6 +47,27 @@ cannot be produced, or does not carry a recognised verdict, an explicit UNKNOWN 
 is delivered instead and the process exits non-zero so the scheduler records a failure
 as well. Silence and a green status are both unacceptable outcomes for a watchdog.
 
+The failure text comes from the tool too
+----------------------------------------
+The success path was already read from the trace so the model could not rewrite it, but
+the failure path was not: a failed tool call was skipped, the run fell through to the
+model's reply, and the alert went out carrying whatever prose the model had produced
+about the failure. On a 7B model that prose was a friendly paraphrase, and the run also
+burned ten tool iterations getting there.
+
+So a failed tool call is now recognised the moment it lands, exactly like a successful
+one. The plugin's own `error_reason` becomes the alert body, and the agent is stopped
+right there. The alert a human reads is therefore always the plugin's wording, whether
+the news is good or bad.
+
+Usage
+-----
+    python3 contrib/daily_report.py --recipient <chat id>
+    python3 contrib/daily_report.py --recipient <chat id> --wallet <bad address>
+
+The second form is how the failure path is demonstrated on demand: it drives the same
+code path the 8 AM job uses, against a wallet the upstream API rejects.
+
 Python rather than shell because ZeroClaw's default risk profile allowlists `python3`
 for scheduled commands but not `sh`, so this runs without loosening the host policy.
 
@@ -60,6 +81,7 @@ Usage
     --recipient  chat id / recipient           (required,          or $ZC_RECIPIENT)
     --trace      runtime trace path            (default: ~/.zeroclaw/data/state/runtime-trace.jsonl)
     --deadline   seconds to wait for the tool result (default: 95, or $ZC_DEADLINE)
+    --wallet     override the configured wallet (default: none, use the config value)
 """
 import argparse
 import datetime
@@ -71,6 +93,17 @@ import time
 
 PROMPT = ("Call the kamino_sentinel tool with no arguments. "
           "Reply with the exact tool output text only, no commentary.")
+
+# Only the tool call differs; the reply instruction is identical because the reply is
+# discarded either way. The wallet is interpolated rather than passed as a flag because
+# the tool is reached through the agent, which is the point of the demonstration: the
+# same path the scheduler uses, not a private back door.
+PROMPT_WALLET = ("Call the kamino_sentinel tool with the wallet argument set exactly to "
+                 "%s. Reply with the exact tool output text only, no commentary.")
+
+
+def build_prompt(wallet):
+    return PROMPT if not wallet else PROMPT_WALLET % wallet
 
 UNKNOWN_PREFIX = ("[UNKNOWN] Kamino sentinel could not read the position. "
                   "This is NOT a NO-POSITION result. Check manually.")
@@ -116,6 +149,8 @@ def parse_args():
     p.add_argument("--deadline", type=float,
                    default=float(os.environ.get("ZC_DEADLINE", DEFAULT_DEADLINE_S)),
                    help="seconds to wait for the tool result before giving up")
+    p.add_argument("--wallet", default=os.environ.get("ZC_WALLET"),
+                   help="override the configured wallet (used to exercise the failure path)")
     a = p.parse_args()
     if not a.recipient:
         p.error("--recipient (or ZC_RECIPIENT) is required")
@@ -123,14 +158,21 @@ def parse_args():
     return a
 
 
-def tool_output_since(trace_path, since_iso):
-    """Newest kamino_sentinel tool result recorded after `since_iso`, or None.
+def scan_trace(trace_path, since_iso):
+    """Newest kamino_sentinel result recorded after `since_iso`, as (ok_text, err_text).
 
-    Read from the trace rather than the model's reply so the delivered text is exactly
-    what the plugin produced. Entries older than this run are ignored so a stale result
-    can never be re-delivered as if it were today's.
+    Read from the trace rather than the model's reply so the text a human sees is exactly
+    what the plugin produced, on both paths. Entries older than this run are ignored so a
+    stale result can never be re-delivered as if it were today's.
+
+    The host marks a failed tool call by setting `error_reason`. That is the discriminator,
+    not the text: the failure message deliberately contains the token NO-POSITION inside
+    the sentence denying it, so no amount of string matching on the body can be trusted to
+    tell the two apart. Successes and failures are therefore kept in separate slots and
+    never fall through to one another.
     """
-    best = None
+    ok_best = None
+    err_best = None
     try:
         with open(trace_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -149,17 +191,25 @@ def tool_output_since(trace_path, since_iso):
                 ts = row.get("@timestamp", "")
                 if ts <= since_iso:
                     continue
-                # The host records a failed tool call with `error_reason` set. Skip those
-                # outright rather than relying on the text check downstream to catch them.
-                if attrs.get("error_reason"):
+
+                reason = attrs.get("error_reason")
+                if reason and str(reason).strip():
+                    if err_best is None or ts >= err_best[0]:
+                        err_best = (ts, str(reason).strip())
                     continue
+
                 out = attrs.get("output")
                 if isinstance(out, str) and out.strip():
-                    if best is None or ts >= best[0]:
-                        best = (ts, out.strip())
+                    if ok_best is None or ts >= ok_best[0]:
+                        ok_best = (ts, out.strip())
     except OSError:
-        return None
-    return best[1] if best else None
+        return None, None
+    return (ok_best[1] if ok_best else None), (err_best[1] if err_best else None)
+
+
+def tool_output_since(trace_path, since_iso):
+    """Successful tool output only. Kept as the narrow form of `scan_trace`."""
+    return scan_trace(trace_path, since_iso)[0]
 
 
 def deliver(args, body):
@@ -187,17 +237,23 @@ def produce(args):
     """
     started = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     proc = subprocess.Popen(
-        [args.bin, "agent", "--agent", args.agent, "-m", PROMPT],
+        [args.bin, "agent", "--agent", args.agent, "-m", build_prompt(args.wallet)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True)
 
     deadline = time.monotonic() + args.deadline
     found = None
+    failed = None
     while time.monotonic() < deadline:
-        found = tool_output_since(args.trace, started)
-        if has_verdict(found):
+        ok_text, err_text = scan_trace(args.trace, started)
+        if has_verdict(ok_text):
+            found = ok_text
             break
-        found = None
+        if err_text:
+            # A failure is a result. Stop here instead of letting the model spend the
+            # remaining budget narrating it, which is what used to happen.
+            failed = err_text
+            break
         if proc.poll() is not None:      # agent exited on its own
             break
         time.sleep(1.0)
@@ -212,6 +268,9 @@ def produce(args):
 
     if found:
         return found, True
+
+    if failed:
+        return failed, False
 
     # No tool result. Fall back to whatever the agent printed, if it carries a verdict.
     try:
@@ -234,7 +293,11 @@ def main():
     if not ok:
         detail = report[:500] if report else "(no output)"
         deliver(args, "%s\n\n%s" % (UNKNOWN_PREFIX, detail))
+        # Print the reason, not just the fact. The scheduler stores stdout/stderr with the
+        # run, so this is the only place a human debugging a 3 AM failure will find out
+        # what actually broke without going back to the raw trace.
         print("sentinel run failed; UNKNOWN alert dispatched", file=sys.stderr)
+        print(detail, file=sys.stderr)
         return 1
 
     if not deliver(args, report):

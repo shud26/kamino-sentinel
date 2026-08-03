@@ -5,13 +5,13 @@ the thing. No slides. Terminal + phone is perfect."* → **슬라이드 금지. 
 
 ## 언제 찍을까
 
-`cron_runs` 테이블이 **증거 샷의 핵심**인데 지금 2줄뿐이다(7/29 맥미니 이관 때 DB가 새로 생김).
-하루 지날 때마다 한 줄씩 는다.
+`cron_runs` 테이블이 **증거 샷의 핵심**인데 7/29 맥미니 이관 때 DB가 새로 생겨서 줄 수가 적다.
+하루 지날 때마다 아침 8시에 한 줄씩 는다.
 
-| 촬영일 | 표에 찍히는 줄 수 |
+| 촬영일(아침 8시 이후) | 표에 찍히는 줄 수 |
 |---|---|
-| 오늘(7/31) | 2 |
-| 8/2 | 4 |
+| 8/1 (실측) | 3 |
+| 8/3 | 5 |
 | **8/4** | **6** ← 권장 |
 | 8/6 | 8 (마감 직전이라 위험) |
 
@@ -55,11 +55,12 @@ the thing. No slides. Terminal + phone is perfect."* → **슬라이드 금지. 
 **손으로 스크립트를 돌리지 않는다.** 진짜 스케줄러를 쓴다.
 
 ```sh
-zeroclaw cron once 1m \
+zeroclaw cron once --agent spike 1m \
   'python3 /Users/shud/kamino-sentinel/contrib/daily_report.py \
-     --bin /Users/shud/zeroclaw-bin/zeroclaw --recipient <CHAT_ID>' \
-  --agent spike
+     --bin /Users/shud/zeroclaw-bin/zeroclaw --recipient <CHAT_ID>'
 ```
+
+⚠️ `--agent`는 **delay 앞**에 와야 한다 (`Usage: cron once [OPTIONS] --agent <ALIAS> <DELAY> <COMMAND>`).
 
 > "That's the same scheduler that runs the 8 AM job. One-shot, fires in a minute."
 
@@ -89,28 +90,37 @@ grep -A6 '^\[dependencies\]' Cargo.toml
 이게 다른 제출물과 갈리는 지점이다. **고장난 모습을 일부러 보여준다.**
 
 ```sh
-zeroclaw agent --agent spike -m \
-  "Call the kamino_sentinel tool with the wallet argument set exactly to INVALIDWALLET123."
+python3 contrib/daily_report.py --recipient <CHAT_ID> --wallet INVALIDWALLET123
+echo "exit: $?"
 ```
 
-트레이스에서 결과를 꺼내 보여준다:
+약 32초 뒤 화면에 그대로 뜬다:
 
 ```
+sentinel run failed; UNKNOWN alert dispatched
 [UNKNOWN] Kamino lookup failed — INVALIDWALLET123
 Could not read the position. This is NOT a no-position result.
+The collateral may be at risk; check manually.
+Cause: failed after 3 attempts — HTTP 400: ...
+exit: 1
 ```
 
 > "A failed lookup is not 'you have no position'. Those are different states, and for a
 > watchdog, confusing them is the worst thing it can do. It fails loud, and the job exits
 > non-zero so the scheduler records a failure too."
 
-⚠️ 이 샷은 에이전트가 타임아웃될 수 있다(7b가 계속 떠듦). **트레이스에 결과가 뜨는 즉시 컷.**
+⚠️ **에이전트를 직접 부르는 예전 방식은 쓰지 말 것.** 8/2 리허설 실측: 화면이 7분 넘게
+백지였다가 모델이 **자기 말로 고쳐 쓴 요약문**만 떴다. 도구 원문이 화면에 없으면
+이 샷은 자기 논지를 반박한다. 위 명령은 8시 잡과 같은 경로로 32초 만에 원문을 보여준다.
 
 ### 2:15–2:40 · 매일 돈다는 증거 — 터미널
 ```sh
 sqlite3 -header -column ~/.zeroclaw/data/cron/jobs.db \
-  "SELECT started_at, status, duration_ms FROM cron_runs ORDER BY started_at DESC LIMIT 8;"
+  "SELECT datetime(started_at,'localtime') AS run_kst, status, duration_ms
+     FROM cron_runs ORDER BY started_at DESC LIMIT 8;"
 ```
+
+⚠️ `localtime` 필수 — 원본은 UTC라 `23:00`으로 찍힌다(자막과 어긋남).
 
 > "Every row is a real 8 AM run. And `ok` here means delivered, not just executed —
 > the script exits non-zero if the Telegram send fails. That distinction cost me six days."

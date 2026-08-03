@@ -14,8 +14,10 @@ The strings below are not invented. `FETCH_FAILURE` is copied from a real runtim
 produced by calling the tool with an invalid wallet.
 """
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("daily_report", os.path.join(_HERE, "daily_report.py"))
@@ -57,6 +59,87 @@ CASES = [
 ]
 
 
+def _trace_line(ts, output=None, error_reason=None, tool="kamino_sentinel"):
+    attrs = {"tool": tool}
+    if output is not None:
+        attrs["output"] = output
+    if error_reason is not None:
+        attrs["error_reason"] = error_reason
+    return json.dumps({"@timestamp": ts, "message": "tool_call_result", "attributes": attrs})
+
+
+OK_LINE = "[OK] Kamino sentinel — 4DNPMDrqt6\n- #1: deposit $94.84 | borrow $25.02"
+ERR_LINE = ("[UNKNOWN] Kamino lookup failed — INVALIDWALLET123\n"
+            "Could not read the position. This is NOT a no-position result.")
+
+
+def scan_cases():
+    """(name, trace lines, since, expected_ok, expected_err) for scan_trace."""
+    return [
+        ("success is returned as ok",
+         [_trace_line("2026-08-02T10:00:00Z", output=OK_LINE)],
+         "2026-08-02T09:00:00", OK_LINE, None),
+
+        # The whole point: a failed call must never arrive in the ok slot.
+        ("failure never lands in the ok slot",
+         [_trace_line("2026-08-02T10:00:00Z", output="Error: " + ERR_LINE, error_reason=ERR_LINE)],
+         "2026-08-02T09:00:00", None, ERR_LINE),
+
+        ("entries older than the run are ignored",
+         [_trace_line("2026-08-02T08:00:00Z", output=OK_LINE)],
+         "2026-08-02T09:00:00", None, None),
+
+        ("newest success wins",
+         [_trace_line("2026-08-02T10:00:00Z", output="[OK] older"),
+          _trace_line("2026-08-02T11:00:00Z", output=OK_LINE)],
+         "2026-08-02T09:00:00", OK_LINE, None),
+
+        ("another tool's result is not ours",
+         [_trace_line("2026-08-02T10:00:00Z", output=OK_LINE, tool="something_else")],
+         "2026-08-02T09:00:00", None, None),
+
+        # A run that fails and then succeeds on retry must still surface the success.
+        ("success after a failure is still a success",
+         [_trace_line("2026-08-02T10:00:00Z", output="Error", error_reason=ERR_LINE),
+          _trace_line("2026-08-02T10:00:05Z", output=OK_LINE)],
+         "2026-08-02T09:00:00", OK_LINE, ERR_LINE),
+    ]
+
+
+def run_scan_tests():
+    failures = []
+    for name, lines, since, exp_ok, exp_err in scan_cases():
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            got_ok, got_err = daily_report.scan_trace(path, since)
+        finally:
+            os.unlink(path)
+        good = (got_ok == exp_ok) and (got_err == exp_err)
+        if not good:
+            failures.append(name)
+        print("%-4s %-42s" % ("PASS" if good else "FAIL", name))
+    return failures
+
+
+def run_prompt_tests():
+    failures = []
+    cases = [
+        ("no wallet uses the default prompt",
+         daily_report.build_prompt(None) == daily_report.PROMPT),
+        ("wallet is interpolated verbatim",
+         "INVALIDWALLET123" in daily_report.build_prompt("INVALIDWALLET123")),
+        ("wallet prompt still suppresses commentary",
+         "no commentary" in daily_report.build_prompt("INVALIDWALLET123")),
+    ]
+    for name, good in cases:
+        if not good:
+            failures.append(name)
+        print("%-4s %-42s" % ("PASS" if good else "FAIL", name))
+    return failures
+
+
 def main():
     failures = []
     for name, text, expected in CASES:
@@ -67,10 +150,16 @@ def main():
         print("%-4s %-42s expected=%-5s got=%s" % (status, name, expected, got))
 
     print()
+    failures += run_scan_tests()
+    print()
+    failures += run_prompt_tests()
+
+    total = len(CASES) + len(scan_cases()) + 3
+    print()
     if failures:
         print("%d failed: %s" % (len(failures), ", ".join(failures)))
         return 1
-    print("all %d passed" % len(CASES))
+    print("all %d passed" % total)
     return 0
 
 
